@@ -96,6 +96,8 @@ macro(flagtree_configure_options)
       # shared-memory effects), and add_definitions does not reach mlir-tblgen.
       list(APPEND LLVM_TABLEGEN_FLAGS -D__MCTLE__)
     endif()
+    add_definitions(-D__FLAGTREE_RLC_ENHANCE__)
+    list(APPEND LLVM_TABLEGEN_FLAGS -D__FLAGTREE_RLC_ENHANCE__)
     set(FLAGTREE_TLE OFF)
     remove_definitions(-D__TLE__)
     list(REMOVE_ITEM LLVM_TABLEGEN_FLAGS -D__TLE__)
