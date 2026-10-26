@@ -269,7 +269,7 @@ class MACABackend(BaseBackend):
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         if enable_mctle:
             mctle.passes.add_reject_dot_op(pm)
@@ -282,14 +282,14 @@ class MACABackend(BaseBackend):
             disable_prefetch = True
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_int8_pass(pm, opt.num_stages, opt.pipeline)
         metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
         if not os.getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT"):
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_constancy_load_layout(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
         if store_coalesce:
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_from_repn_to_elemn_pass(pm)
             metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_cstore_pass(pm, opt.num_stages)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
         passes.common.add_cse(pm)
         passes.ttgpuir.add_fuse_nested_loops(pm)
@@ -304,7 +304,7 @@ class MACABackend(BaseBackend):
                 else:
                     mixed = True if 'mixed' in opt.pipeline else False
                     metax.passes.ttgpuir.add_tritonmetaxgpu_addptr_opt_pass(pm, opt.num_stages, fullstage, mixed)
-                    passes.ttgpuir.add_remove_layout_conversions(pm)
+                    passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
                     metax.passes.ttgpuir.add_pipeline_async_tn(pm, opt.num_stages, inner_stages[0], inner_stages[1])
                     metax.passes.ttgpuir.add_pipeline_async_tt(pm, opt.num_stages)
                     metax.passes.ttgpuir.add_pipeline_async_base(pm, opt.num_stages, fullstage, mixed)
@@ -312,7 +312,7 @@ class MACABackend(BaseBackend):
                 passes.ttgpuir.add_pipeline(pm, opt.num_stages, dump_enabled)
         passes.ttgpuir.add_prefetch(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.metax.rlc_enhance)
         metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_smem_usage(pm, reduce_smem_usage)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
