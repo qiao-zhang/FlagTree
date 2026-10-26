@@ -420,7 +420,7 @@ class HIPBackend(BaseBackend):
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_process_shared_memory_hint(pm)  # flagtree hints
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
         passes.ttgpuir.add_optimize_thread_locality(pm)
         # begin flagtree tle
         tle.passes.add_select_encodings(pm)
@@ -430,13 +430,13 @@ class HIPBackend(BaseBackend):
         # end flagtree tle
         hcu.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack,
                                                  options.mmac_layout_force)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
         if options.optimize_epilogue:
             hcu.passes.ttgpuir.add_optimize_epilogue(pm)
         hcu.passes.ttgpuir.add_optimize_dot_operands(pm, options.arch)
 
         hcu.passes.ttgpuir.add_mls_encoding_insertion(pm)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
 
         hcu.passes.ttgpuir.add_hoist_layout_conversions(pm)
 
@@ -472,14 +472,14 @@ class HIPBackend(BaseBackend):
         if options.schedule_hint.lower() != "none":
             for hint in options.schedule_hint.split(","):
                 hcu.passes.ttgpuir.insert_instruction_sched_hints(pm, hint)
-        passes.ttgpuir.add_remove_layout_conversions(pm)
+        passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
 
         hcu.passes.ttgpuir.add_mls_lowering_pass(pm)
 
         passes.ttgpuir.add_reduce_data_duplication(pm)
         if is_in_thread_transpose_enabled(options.arch):
             hcu.passes.ttgpuir.add_in_thread_transpose(pm)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
         hcu.passes.ttgpuir.add_reorder_instructions(pm)
         if use_block_pingpong and options.num_stages > 1:
             hcu.passes.ttgpuir.add_block_pingpong(pm, options.num_stages)
@@ -489,7 +489,7 @@ class HIPBackend(BaseBackend):
                                                    options.wasp_num_mma_warps)
             hcu.passes.ttgpuir.add_accelerate_matmul(pm, options.arch, options.matrix_instr_nonkdim, options.kpack,
                                                      options.mmac_layout_force)
-            passes.ttgpuir.add_remove_layout_conversions(pm)
+            passes.ttgpuir.add_remove_layout_conversions(pm, knobs.hcu.rlc_enhance)
             if options.optimize_epilogue:
                 hcu.passes.ttgpuir.add_optimize_epilogue(pm)
             passes.ttgpuir.add_optimize_dot_operands(pm, True)

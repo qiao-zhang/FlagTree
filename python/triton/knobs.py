@@ -640,6 +640,7 @@ class hcu_knobs(base_knobs):
     use_async_copy: env_bool = env_bool("TRITON_HIP_USE_ASYNC_COPY")
     scalarize_packed_fops: env_bool = env_bool("AMDGCN_SCALARIZE_PACKED_FOPS")
 
+    rlc_enhance: env_bool = env_bool("FLAGTREE_RLC_ENHANCE", True)
 
 # flagtree metax
 class metax_knobs(base_knobs):
