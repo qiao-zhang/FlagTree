@@ -3836,10 +3836,35 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
                 op->getParentOfType<scf::WhileOp>() != nullptr;
   if (inLoop) {
     auto targetType = resultType.cloneWithEncoding(encoding);
-    if (int64_t(getTotalElemsPerThread(targetType)) *
-            elementType.getIntOrFloatBitWidth() >
-        256)
+
+    int64_t basePerThread = getTotalElemsPerThread(resultType);
+    int64_t newPerThread = getTotalElemsPerThread(targetType);
+    int64_t idealPerThread = std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(), numThreads));
+
+    // Temporary diagnostic; remove after locating the regression.
+    llvm::errs()
+        << "[rlc-remat-load] candidate"
+        << " base=" << basePerThread
+        << " target=" << newPerThread
+        << " ideal=" << idealPerThread
+        << " target_encoding=" << encoding
+        << " op=" << *op << "\n";
+
+    // Match the strict Phase 2 guard:
+    // reject newly increased footprint above the ideal distribution.
+    if (newPerThread > basePerThread &&
+        newPerThread > idealPerThread) {
+      llvm::errs()
+          << "[rlc-remat-load] reject: increased footprint above ideal\n";
       return false;
+    }
+
+    // Keep the existing absolute limit.
+    if (newPerThread * elementType.getIntOrFloatBitWidth() > 256) {
+      llvm::errs()
+          << "[rlc-remat-load] reject: footprint exceeds 256 bits\n";
+      return false;
+    }
   }
 
   if (preservesWritebackMemoryAccess(ptrType, resultType, encoding,
