@@ -985,7 +985,7 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
                     defOp->getParentOfType<scf::WhileOp>() != nullptr;
       if (inLoop && resultType) {
         auto mod = defOp->getParentOfType<ModuleOp>();
-        int64_t numThreads = lookupNumWraps(defOp) * TritonGPUDialect::getThreadsPerWarp(mod);
+        int64_t numThreads = lookupNumWarps(defOp) * TritonGPUDialect::getThreadsPerWarp(mod);
         int64_t basePerThread = getTotalElemsPerThread(resultType);
         auto targetType = resultType.cloneWithEncoding(encoding);
         int64_t newPerThread = getTotalElemsPerThread(targetType);
