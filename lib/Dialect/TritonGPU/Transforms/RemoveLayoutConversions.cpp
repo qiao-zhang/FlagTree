@@ -983,6 +983,26 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
       auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
       bool inLoop = defOp->getParentOfType<scf::ForOp>() != nullptr ||
                     defOp->getParentOfType<scf::WhileOp>() != nullptr;
+      if (inLoop && resultType) {
+        auto mod = defOp->getParentOfType<ModuleOp>();
+        int64_t numThreads = lookupNumWraps(defOp) * TritonGPUDialect::getThreadsPerWarp(mod);
+        int64_t basePerThread = getTotalElemsPerThread(resultType);
+        auto targetType = resultType.cloneWithEncoding(encoding);
+        int64_t newPerThread = getTotalElemsPerThread(targetType);
+        int64_t idealPerThread = std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(), numThreads));
+
+        if (newPerThread > basePerThread && newPerThread > idealPerThread) {
+          LLVM_DEBUG({
+            DBGS() << "Rejecting proposal for expensive load " << *defOp
+                   << " because it widens the per-thread access from "
+                   << basePerThread << " to " << newPerThread
+                   << ", which is above the ideal " << idealPerThread
+                   << " for a total of " << resultType.getNumElements()
+                   << " elements across " << numThreads << " threads.\n";
+          });
+          return false;
+        }
+      }
       if (!preservesWritebackMemoryAccess(ptrType, resultType, encoding,
                                           /*allowNarrowerContiguity=*/false) &&
           (inLoop ||
