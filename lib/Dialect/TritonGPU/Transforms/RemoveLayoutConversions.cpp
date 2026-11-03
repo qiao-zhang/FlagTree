@@ -983,6 +983,26 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
       auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
       bool inLoop = defOp->getParentOfType<scf::ForOp>() != nullptr ||
                     defOp->getParentOfType<scf::WhileOp>() != nullptr;
+      if (inLoop && resultType) {
+        auto mod = defOp->getParentOfType<ModuleOp>();
+        int64_t numThreads = lookupNumWarps(defOp) * TritonGPUDialect::getThreadsPerWarp(mod);
+        int64_t basePerThread = getTotalElemsPerThread(resultType);
+        auto targetType = resultType.cloneWithEncoding(encoding);
+        int64_t newPerThread = getTotalElemsPerThread(targetType);
+        int64_t idealPerThread = std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(), numThreads));
+
+        if (newPerThread > basePerThread && newPerThread > idealPerThread) {
+          LLVM_DEBUG({
+            DBGS() << "Rejecting proposal for expensive load " << *defOp
+                   << " because it widens the per-thread access from "
+                   << basePerThread << " to " << newPerThread
+                   << ", which is above the ideal " << idealPerThread
+                   << " for a total of " << resultType.getNumElements()
+                   << " elements across " << numThreads << " threads.\n";
+          });
+          return false;
+        }
+      }
       if (!preservesWritebackMemoryAccess(ptrType, resultType, encoding,
                                           /*allowNarrowerContiguity=*/false) &&
           (inLoop ||
@@ -1871,6 +1891,13 @@ static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
       !isa_and_nonnull<BlockedEncodingAttr>(dstEncoding))
     return false;
   if (isSliceEncoding(srcEncoding) || isSliceEncoding(dstEncoding))
+    return false;
+
+  // Do not seed a conversion that hands an elementwise producer a layout with a
+  // narrower per-thread contiguity.
+  auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());
+  auto dstType = cast<RankedTensorType>(cvtOp.getResult().getType());
+  if (getContigAlongMemoryOrder(dstType) < getContigAlongMemoryOrder(srcType))
     return false;
 
   Value src = cvtOp.getSrc();
@@ -3816,10 +3843,24 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
                 op->getParentOfType<scf::WhileOp>() != nullptr;
   if (inLoop) {
     auto targetType = resultType.cloneWithEncoding(encoding);
-    if (int64_t(getTotalElemsPerThread(targetType)) *
-            elementType.getIntOrFloatBitWidth() >
-        256)
+
+    int64_t basePerThread = getTotalElemsPerThread(resultType);
+    int64_t newPerThread = getTotalElemsPerThread(targetType);
+    int64_t idealPerThread = std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(), numThreads));
+
+    // Match the strict Phase 2 guard:
+    // reject newly increased footprint above the ideal distribution.
+    if (newPerThread > basePerThread &&
+        newPerThread > idealPerThread) {
+      LDBG("[rlc-remat-load] reject: increased footprint above ideal");
       return false;
+    }
+
+    // Keep the existing absolute limit.
+    if (newPerThread * elementType.getIntOrFloatBitWidth() > 256) {
+      LDBG("[rlc-remat-load] reject: footprint exceeds 256 bits");
+      return false;
+    }
   }
 
   if (preservesWritebackMemoryAccess(ptrType, resultType, encoding,
