@@ -1295,10 +1295,25 @@ int LayoutPropagation::countConvertsRemovedByProposal(
 
     Attribute srcEncoding = getProposalEncoding(proposal, cvtOp.getSrc());
     Attribute resultEncoding = getProposalEncoding(proposal, cvtOp.getResult());
+    bool srcFromProposal = srcEncoding != nullptr;
+    bool resultFromProposal = resultEncoding != nullptr;
     if (!srcEncoding)
       srcEncoding = originalSrcEncoding;
     if (!resultEncoding)
       resultEncoding = originalResultEncoding;
+    if (std::getenv("RLC_DEBUG_P2"))
+      llvm::errs() << "[p2-cvt] src=" << cvtOp.getSrc()
+                   << "\n         origSrc=" << originalSrcEncoding
+                   << " origDst=" << originalResultEncoding
+                   << "\n         propSrc=" << srcEncoding
+                   << (srcFromProposal ? " (from proposal)" : " (fallback: src NOT in proposal)")
+                   << "\n         propDst=" << resultEncoding
+                   << (resultFromProposal ? " (from proposal)" : " (fallback)")
+                   << "\n         srcRetaggable=" << isSmallComponentRetaggable(cvtOp.getSrc())
+                   << " counted="
+                   << (srcEncoding == resultEncoding &&
+                       originalSrcEncoding != originalResultEncoding)
+                   << "\n";
     // A proposal may claim that src will take `srcEncoding`, but a coalesced
     // (expensive) load is never retagged (see isSmallComponentRetaggable), so in
     // the rewritten IR the convert is still there. Counting it as "removed"
@@ -2374,6 +2389,45 @@ bool LayoutPropagation::solveSmallComponents() {
         llvm::errs() << "[p2-reject] narrowed=" << narrowedWritebacks
                      << " >= removed=" << removedConverts << "\n";
       return false;
+    }
+    // A proposal must not move the consumers of an expensive (coalesced) load:
+    // the load itself can never be retagged (see isSmallComponentRetaggable), so
+    // every value downstream of it needs a convert -- and that is exactly the
+    // convert the proposal claims to remove. coalesce scatter: %k_28 (tt.load,
+    // [4]) stays where it is, the whole `pos` chain moves to [1], the convert on
+    // that edge survives, and two more appear (gather result, vals load).
+    auto producerKeepsItsLayout = [&](Value operand) {
+      for (unsigned depth = 0; depth < 4; ++depth) {
+        Operation *def = operand.getDefiningOp();
+        if (!def)
+          return false;
+        if (auto cvt = dyn_cast<ConvertLayoutOp>(def)) {
+          operand = cvt.getSrc();
+          continue;
+        }
+        return isa<LoadOp, StoreOp>(def) && isExpensiveLoadOrStore(def);
+      }
+      return false;
+    };
+    for (auto &it : proposal) {
+      Operation *defOp = it.first.getDefiningOp();
+      if (!defOp)
+        continue;
+      for (Value operand : defOp->getOperands()) {
+        if (proposal.count(operand))
+          continue;
+        auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+        if (!operandType || !operandType.getEncoding() ||
+            operandType.getEncoding() == it.second)
+          continue;
+        if (!producerKeepsItsLayout(operand))
+          continue;
+        if (std::getenv("RLC_DEBUG_P2"))
+          llvm::errs() << "[p2-reject] " << it.first
+                       << " moves away from a coalesced load " << operand
+                       << " (keeps " << operandType.getEncoding() << ")\n";
+        return false;
+      }
     }
     // A "weak" proposal removes a single one-shot convert outside any loop; its
     // layout ripple can cost more than it saves, so only loop-resident or
