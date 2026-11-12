@@ -59,6 +59,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <deque>
+#include <cstdlib>
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include "llvm/ADT/EquivalenceClasses.h"
 #include <optional>
@@ -2068,17 +2069,58 @@ static bool narrowsPerThreadWriteback(Value ptr, Attribute target) {
 }
 
 // True if any global writeback reached by `value` would be narrowed by `target`.
-static bool valueNarrowsWriteback(Value value, Attribute target) {
-  for (Operation *user : value.getUsers()) {
-    Value ptr;
-    if (auto storeOp = dyn_cast<StoreOp>(user))
-      ptr = storeOp.getPtr();
-    else if (auto atomicOp = dyn_cast<AtomicRMWOp>(user))
-      ptr = atomicOp.getPtr();
-    else
-      continue;
-    if (narrowsPerThreadWriteback(ptr, target))
-      return true;
+//
+// Walking down is the point: Phase 2 often proposes a *producer* chain
+// (collectProducerSideConvert), where the values feed casts / converts /
+// `tt.addptr` and only reach the store several hops later. A direct-user test
+// (the first version of this check) therefore never fires on the coalesce
+// scatter case, even though the relocation it allows does narrow the writeback.
+static bool isTransparentTowardsWriteback(Operation *op) {
+  if (!op || op->getNumRegions() != 0)
+    return false;
+  if (op->hasTrait<OpTrait::Elementwise>())
+    return true;
+  // Match `tt.addptr` by name: this file never references the generated
+  // AddPtrOp class, and a rename on that side would be a hard compile error
+  // for a diagnostic-only helper.
+  if (op->getName().getStringRef() == "tt.addptr")
+    return true;
+  return isa<ConvertLayoutOp, ExpandDimsOp, BroadcastOp, SplatOp,
+             arith::ExtSIOp, arith::ExtUIOp, arith::ExtFOp, arith::TruncIOp,
+             arith::TruncFOp, BitcastOp>(op);
+}
+
+static bool valueNarrowsWriteback(Value value, Attribute target,
+                                  unsigned maxDepth = 8) {
+  if (!target)
+    return false;
+  SmallVector<Value> worklist{value};
+  DenseSet<Value> seen;
+  unsigned depth = 0;
+  while (!worklist.empty() && depth <= maxDepth) {
+    SmallVector<Value> next;
+    for (Value v : worklist) {
+      if (!seen.insert(v).second)
+        continue;
+      for (Operation *user : v.getUsers()) {
+        if (auto storeOp = dyn_cast<StoreOp>(user)) {
+          if (narrowsPerThreadWriteback(storeOp.getPtr(), target))
+            return true;
+          continue;
+        }
+        if (auto atomicOp = dyn_cast<AtomicRMWOp>(user)) {
+          if (narrowsPerThreadWriteback(atomicOp.getPtr(), target))
+            return true;
+          continue;
+        }
+        if (!isTransparentTowardsWriteback(user))
+          continue;
+        for (Value result : user->getResults())
+          next.push_back(result);
+      }
+    }
+    worklist = std::move(next);
+    ++depth;
   }
   return false;
 }
@@ -2290,8 +2332,12 @@ bool LayoutPropagation::solveSmallComponents() {
     if (proposal.empty())
       return false;
     for (auto &it : proposal)
-      if (valueNarrowsWriteback(it.first, it.second))
+      if (valueNarrowsWriteback(it.first, it.second)) {
+        if (std::getenv("RLC_DEBUG_P2"))
+          llvm::errs() << "[p2-reject] narrowing writeback: " << it.first
+                       << " -> " << it.second << "\n";
         return false;
+      }
 #ifdef __TLE__
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath). Nor retag
