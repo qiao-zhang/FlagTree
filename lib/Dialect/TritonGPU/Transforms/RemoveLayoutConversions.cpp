@@ -57,6 +57,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 #include <deque>
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -2051,6 +2052,37 @@ static unsigned getContigAlongMemoryOrder(RankedTensorType type) {
   return dim < contigPerThread.size() ? contigPerThread[dim] : 1;
 }
 
+// A global writeback that already issues `spt` elements per thread loses ILP
+// when a relayout narrows it: for a 1024-element block, 4 -> 1 turns one round
+// into four, while the convert it removes is only ~10 KB of shared memory.
+// Refuse to narrow a writeback that is not compute-bound (its value is just a
+// load copy) -- see the coalesce/scatter case where this cost 26% latency.
+static bool narrowsPerThreadWriteback(Value ptr, Attribute target) {
+  auto ptrType = dyn_cast<RankedTensorType>(ptr.getType());
+  if (!ptrType || !ptrType.getEncoding() || !target)
+    return false;
+  if (ptrType.getEncoding() == target)
+    return false;
+  return getContigAlongMemoryOrder(ptrType.cloneWithEncoding(target)) <
+         getContigAlongMemoryOrder(ptrType);
+}
+
+// True if any global writeback reached by `value` would be narrowed by `target`.
+static bool valueNarrowsWriteback(Value value, Attribute target) {
+  for (Operation *user : value.getUsers()) {
+    Value ptr;
+    if (auto storeOp = dyn_cast<StoreOp>(user))
+      ptr = storeOp.getPtr();
+    else if (auto atomicOp = dyn_cast<AtomicRMWOp>(user))
+      ptr = atomicOp.getPtr();
+    else
+      continue;
+    if (narrowsPerThreadWriteback(ptr, target))
+      return true;
+  }
+  return false;
+}
+
 // A writeback retag (ptr/value/mask onto the value's layout) is profitable only
 // when the layout still writes along the same fastest memory dimension with a
 // reasonable per-thread width; otherwise it trades a convert for a worse global
@@ -2257,6 +2289,9 @@ bool LayoutPropagation::solveSmallComponents() {
                                 bool restrictWeakStoreProposals = false) {
     if (proposal.empty())
       return false;
+    for (auto &it : proposal)
+      if (valueNarrowsWriteback(it.first, it.second))
+        return false;
 #ifdef __TLE__
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath). Nor retag
@@ -3166,7 +3201,8 @@ void LayoutPropagation::resolveConflicts() {
     Value value = it.first;
     Operation *defOp = value.getDefiningOp();
     if (auto preferred = smallComponentPreferredEncoding.lookup(value)) {
-      if (info.encodings.contains(preferred)) {
+      if (info.encodings.contains(preferred) &&
+          !valueNarrowsWriteback(value, preferred)) {
         info.encodings.clear();
         info.encodings.insert(preferred);
         continue;
@@ -5188,6 +5224,19 @@ void hoistConvert(ModuleOp module) {
     layoutRemat.cleanup();
   });
 }
+
+#ifdef __FLAGTREE_RLC_ENHANCE__
+// Environment override for one per-phase switch of the enhanced pipeline. A
+// variable holding a boolean value ("1"/"on"/"true" or "0"/"off"/"false") wins
+// over the corresponding pass option, so a phase can be turned on or off
+// without rebuilding the pipeline; an unset or unrecognized value keeps
+// whatever the option carries.
+static bool envOverride(const char *envVar, bool optionValue) {
+  std::optional<bool> envValue =
+      tools::isEnvValueBool(tools::getStrEnv(envVar));
+  return envValue.value_or(optionValue);
+}
+#endif // __FLAGTREE_RLC_ENHANCE__
 } // namespace
 
 class TritonGPURemoveLayoutConversionsPass
@@ -5222,13 +5271,23 @@ public:
 #ifdef __FLAGTREE_RLC_ENHANCE__
     // Per-phase options are AND-ed with the master option. Backward-propagation
     // and small-component solving depend on cost-based resolution (disabling it
-    // forces both off); store-layout remat is independent.
-    bool costBased = enableRlcEnhance && enableCostBasedResolution;
-    bool backwardProp = enableRlcEnhance && enableBackwardPropagation;
+    // forces both off); store-layout remat is independent. Every switch may
+    // additionally be overridden from the environment (see envOverride), which
+    // is what the FLAGTREE_RLC_ENHANCE_* variables below are for.
+    bool costBased =
+        enableRlcEnhance && envOverride("FLAGTREE_RLC_ENHANCE_COST_BASED",
+                                        enableCostBasedResolution);
+    bool backwardProp = enableRlcEnhance &&
+                        envOverride("FLAGTREE_RLC_ENHANCE_BACKWARD_PROPAGATION",
+                                    enableBackwardPropagation);
     bool smallComponentSolving =
-        enableRlcEnhance && enableSmallComponentSolving;
+        enableRlcEnhance &&
+        envOverride("FLAGTREE_RLC_ENHANCE_SMALL_COMPONENT_SOLVING",
+                    enableSmallComponentSolving);
     bool storeLayoutRemat =
-        enableRlcEnhance && enableStoreLayoutRematerialization;
+        enableRlcEnhance &&
+        envOverride("FLAGTREE_RLC_ENHANCE_STORE_LAYOUT_REMAT",
+                    enableStoreLayoutRematerialization);
 
     if (!costBased) {
       backwardProp = false;
