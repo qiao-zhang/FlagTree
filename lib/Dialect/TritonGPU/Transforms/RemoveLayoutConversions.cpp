@@ -2350,9 +2350,9 @@ bool LayoutPropagation::solveSmallComponents() {
     return false;
   };
 
-  auto commitIfProfitable = [&](Proposal &proposal, bool requireBenefit,
-                                bool rejectReachableReductionOrScan = true,
-                                bool restrictWeakStoreProposals = false) {
+  auto tryCommitProposal = [&](Proposal &proposal, bool requireBenefit,
+                               bool rejectReachableReductionOrScan = true,
+                               bool restrictWeakStoreProposals = false) {
     if (proposal.empty())
       return false;
     if (std::getenv("RLC_DEBUG_P2")) {
@@ -2469,6 +2469,31 @@ bool LayoutPropagation::solveSmallComponents() {
     if (requireBenefit && !shouldAcceptProposal(proposal))
       return false;
     return commitProposal(proposal);
+  };
+
+  // A rejected proposal must not leave its preferred encodings behind.
+  // addSmallComponentEncoding() records them while the proposal is still being
+  // collected, and getProposalEncoding()/resolveConflicts() read them back, so a
+  // vetoed proposal would keep steering layouts -- which is how coalesce scatter
+  // lands on [1] even though every proposal it offers reads [1] -> [4]; the check
+  // that rejects the proposal cannot undo the layout it already asked for.
+  auto commitIfProfitable = [&](Proposal &proposal, bool requireBenefit,
+                                bool rejectReachableReductionOrScan = true,
+                                bool restrictWeakStoreProposals = false) {
+    auto savedPreferred = smallComponentPreferredEncoding;
+    bool committed = tryCommitProposal(proposal, requireBenefit,
+                                       rejectReachableReductionOrScan,
+                                       restrictWeakStoreProposals);
+    if (!committed) {
+      smallComponentPreferredEncoding = std::move(savedPreferred);
+      if (std::getenv("RLC_DEBUG_P2"))
+        llvm::errs() << "[p2-reject] rolled back preferred encodings of "
+                     << proposal.size() << " value(s)\n";
+    } else if (std::getenv("RLC_DEBUG_P2")) {
+      llvm::errs() << "[p2-accept] " << proposal.size()
+                   << " value(s) committed\n";
+    }
+    return committed;
   };
 
   auto collectRetaggableStoreValue = [&](Proposal &proposal, Value value,
