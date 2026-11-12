@@ -1299,6 +1299,15 @@ int LayoutPropagation::countConvertsRemovedByProposal(
       srcEncoding = originalSrcEncoding;
     if (!resultEncoding)
       resultEncoding = originalResultEncoding;
+    // A proposal may claim that src will take `srcEncoding`, but a coalesced
+    // (expensive) load is never retagged (see isSmallComponentRetaggable), so in
+    // the rewritten IR the convert is still there. Counting it as "removed"
+    // lets a proposal clear the removedConverts gate with a saving it cannot
+    // deliver -- coalesce scatter: the source stays on [4], the store side moves
+    // to [1], and two more converts appear downstream (3 instead of 0).
+    if (srcEncoding != originalSrcEncoding &&
+        !isSmallComponentRetaggable(cvtOp.getSrc()))
+      continue;
     if (srcEncoding == resultEncoding &&
         originalSrcEncoding != originalResultEncoding)
       ++removed;
@@ -2331,13 +2340,13 @@ bool LayoutPropagation::solveSmallComponents() {
                                 bool restrictWeakStoreProposals = false) {
     if (proposal.empty())
       return false;
-    for (auto &it : proposal)
-      if (valueNarrowsWriteback(it.first, it.second)) {
-        if (std::getenv("RLC_DEBUG_P2"))
-          llvm::errs() << "[p2-reject] narrowing writeback: " << it.first
-                       << " -> " << it.second << "\n";
-        return false;
-      }
+    if (std::getenv("RLC_DEBUG_P2")) {
+      llvm::errs() << "[p2-proposal] " << proposal.size() << " value(s):\n";
+      for (auto &it : proposal)
+        llvm::errs() << "    " << it.first << " -> " << it.second
+                     << "  narrows="
+                     << valueNarrowsWriteback(it.first, it.second) << "\n";
+    }
 #ifdef __TLE__
     // Skip any component on a TLE cluster remote-address chain; retagging it
     // corrupts the remote access (see valueOnTleRemotePointerPath). Nor retag
@@ -2348,8 +2357,24 @@ bool LayoutPropagation::solveSmallComponents() {
         return false;
 #endif // __TLE__
     int removedConverts = countConvertsRemovedByProposal(proposal);
+    if (std::getenv("RLC_DEBUG_P2"))
+      llvm::errs() << "[p2-proposal] removedConverts=" << removedConverts << "\n";
     if (removedConverts == 0)
       return false;
+    // PPU: narrowing a writeback costs per-thread ILP (4 -> 1 elements turns one
+    // round into four), so veto it -- but only when it does not buy at least as
+    // many converts as the writebacks it narrows. A proposal that clears several
+    // converts (coalesce_hist: 2 -> 0) still pays off and must go through.
+    int narrowedWritebacks = 0;
+    for (auto &it : proposal)
+      if (valueNarrowsWriteback(it.first, it.second))
+        ++narrowedWritebacks;
+    if (narrowedWritebacks > 0 && narrowedWritebacks >= removedConverts) {
+      if (std::getenv("RLC_DEBUG_P2"))
+        llvm::errs() << "[p2-reject] narrowed=" << narrowedWritebacks
+                     << " >= removed=" << removedConverts << "\n";
+      return false;
+    }
     // A "weak" proposal removes a single one-shot convert outside any loop; its
     // layout ripple can cost more than it saves, so only loop-resident or
     // multi-convert components are admitted.
