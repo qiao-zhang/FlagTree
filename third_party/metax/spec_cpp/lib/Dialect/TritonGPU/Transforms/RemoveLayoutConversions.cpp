@@ -3262,6 +3262,17 @@ void LayoutPropagation::resolveConflictsByComponent(
         bool better = adjacentToMoved ? cost.total < bestCost.total
                                       : cost.inLoop < bestCost.inLoop &&
                                             cost.total <= bestCost.total;
+        // A kernel with no loop around this component has inLoop == 0 for
+        // every candidate: getScopeLoopFrequencyWeight returns 1 without an
+        // enclosing loop and charge() only accumulates inLoop for weight > 1.
+        // The rule above then never fires (0 < 0 is false), so the per-value
+        // result survives no matter how many boundary converts one shared
+        // encoding would remove. Compare totals in that case as well, keeping
+        // the comparison strict so a tie still leaves the per-value result
+        // alone.
+        if (!better && !adjacentToMoved && cost.inLoop == 0 &&
+            bestCost.inLoop == 0)
+          better = cost.total < bestCost.total;
         if (better) {
           bestCost = cost;
           best = enc;
