@@ -26,6 +26,7 @@
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #include "triton/Analysis/AxisInfo.h"
 #include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/Support/MathExtras.h"
 #include <optional>
 #endif // __FLAGTREE_RLC_ENHANCE__
 
@@ -839,6 +840,27 @@ bool LayoutPropagation::collectProducerClosure(Proposal &proposal, Value target,
       auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
       bool inLoop = defOp->getParentOfType<scf::ForOp>() != nullptr ||
                     defOp->getParentOfType<scf::WhileOp>() != nullptr;
+      // A loop-resident load pays the new per-thread footprint on every
+      // iteration. Reject a retag that raises it past twice the ideal even
+      // share (numElements / numThreads): beyond that point the retag costs
+      // more repeated work per thread than the convert it removes. numThreads
+      // comes from the module's own ttg.threads-per-warp, so this holds for
+      // metax's 64-wide wavefront as well.
+      if (inLoop && resultType) {
+        auto mod = defOp->getParentOfType<ModuleOp>();
+        int64_t numThreads =
+            lookupNumWarps(defOp) * TritonGPUDialect::getThreadsPerWarp(mod);
+        int64_t basePerThread = getTotalElemsPerThread(resultType);
+        auto targetType = resultType.cloneWithEncoding(encoding);
+        int64_t newPerThread = getTotalElemsPerThread(targetType);
+        int64_t idealPerThread =
+            std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(),
+                                                 numThreads));
+
+        if (newPerThread > basePerThread && newPerThread > idealPerThread * 2) {
+          return false;
+        }
+      }
       if (!preservesWritebackMemoryAccess(ptrType, resultType, encoding,
                                           /*allowNarrowerContiguity=*/false) &&
           (inLoop ||
@@ -1727,6 +1749,15 @@ static bool isBackwardPropagationSeedCandidate(ConvertLayoutOp cvtOp) {
       !isa_and_nonnull<BlockedEncodingAttr>(dstEncoding))
     return false;
   if (isSliceEncoding(srcEncoding) || isSliceEncoding(dstEncoding))
+    return false;
+
+  // Do not seed a conversion that hands an elementwise producer a layout with a
+  // narrower per-thread contiguity than the one it reads with today: the
+  // resulting chain trades the seeded convert for a more scattered access
+  // stream upstream.
+  auto srcType = cast<RankedTensorType>(cvtOp.getSrc().getType());
+  auto dstType = cast<RankedTensorType>(cvtOp.getResult().getType());
+  if (getContigAlongMemoryOrder(dstType) < getContigAlongMemoryOrder(srcType))
     return false;
 
   Value src = cvtOp.getSrc();
@@ -3626,10 +3657,24 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
                 op->getParentOfType<scf::WhileOp>() != nullptr;
   if (inLoop) {
     auto targetType = resultType.cloneWithEncoding(encoding);
-    if (int64_t(getTotalElemsPerThread(targetType)) *
-            elementType.getIntOrFloatBitWidth() >
-        256)
+    int64_t basePerThread = getTotalElemsPerThread(resultType);
+    int64_t newPerThread = getTotalElemsPerThread(targetType);
+    int64_t idealPerThread =
+        std::max<int64_t>(1, llvm::divideCeil(resultType.getNumElements(),
+                                             numThreads));
+
+    // Same guard as the strict collectProducerClosure check:
+    // reject newly increased footprint above the ideal distribution.
+    if (newPerThread > basePerThread && newPerThread > idealPerThread * 2) {
+      LDBG("[rlc-remat-load] reject: increased footprint above ideal * 2");
       return false;
+    }
+
+    // Keep the existing absolute limit.
+    if (newPerThread * elementType.getIntOrFloatBitWidth() > 256) {
+      LDBG("[rlc-remat-load] reject: footprint exceeds 256 bits");
+      return false;
+    }
   }
 
   if (preservesWritebackMemoryAccess(ptrType, resultType, encoding,
