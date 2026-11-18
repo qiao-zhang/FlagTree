@@ -4610,6 +4610,56 @@ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
                                        stopPropagation, getExistingConversion);
 }
 
+#ifdef __FLAGTREE_RLC_ENHANCE__
+#ifdef __PPU__
+// A duplicable-load retag moves which dimension each thread owns, so a 1-D
+// slice of the index chain can go from one value per thread to shape[d] of
+// them. Cheap elementwise work does not matter, but a division does: i32 div/rem
+// expand into dozens of instructions with no hardware unit behind them, and the
+// kernel was already executing them. Multiplied per thread, that is pure loss.
+//
+// The check is stated on that quantity -- the per-thread element count of an
+// expensive op's result -- and not on the layout's shape. A shape-derived rule
+// (e.g. "no dimension may lose thread coverage") would also reject retags whose
+// chain is pure address arithmetic, and those are the profitable case: they
+// remove the convert and improve the access pattern at no arithmetic cost.
+//
+// pad_circular, PPU: %b_13 = divsi and %h = remsi live on the row-index chain,
+// tensor<8xi32, slice<dim=1, parent=#blocked>>. Retagging the load from
+// threadsPerWarp [8,4] to [1,32] takes that slice from 1 to 8 elements per
+// thread, so the two divisions run 8x; shared dropped to 0 and the kernel still
+// regressed 16-44%.
+static bool sliceAmplifiesExpensiveWork(
+    const SetVector<Value> &slice, const DenseMap<Value, Attribute> &layout) {
+  for (Value value : slice) {
+    Operation *def = value.getDefiningOp();
+    if (!def || !isExpensiveMathOp(def))
+      continue;
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    Attribute target = layout.lookup(value);
+    if (!type || !type.getEncoding() || !target)
+      continue;
+    int64_t before = getTotalElemsPerThread(type);
+    int64_t after = getTotalElemsPerThread(type.cloneWithEncoding(target));
+    if (after > before) {
+      // `delta` is what the hardware actually pays: an i32 division is issued
+      // `after` times per thread, so the cost scales with that count, not with
+      // the ratio. Logging it lets the threshold be chosen from data instead of
+      // by guesswork.
+      if (rlcDbgLevel() >= 1)
+        llvm::errs() << "[rlc] reject remat: " << def->getName()
+                     << " per-thread " << before << " -> " << after
+                     << " (delta " << (after - before) << ")"
+                     << " (" << rlcDbgEnc(type.getEncoding()) << " -> "
+                     << rlcDbgEnc(target) << ")\n";
+      return true;
+    }
+  }
+  return false;
+}
+#endif // __PPU__
+#endif // __FLAGTREE_RLC_ENHANCE__
+
 LogicalResult LayoutRematerialization::getRematerializableSlice(
     OpOperand &root, Attribute rootEncoding, SetVector<Value> &slice,
     DenseMap<Value, Attribute> &layout,
@@ -4643,6 +4693,12 @@ LogicalResult LayoutRematerialization::getRematerializableSlice(
   // accumulator) never retags the dot. Scoped to the duplicable-load path since
   // otherwise the slice already fails at the dot's input loads.
   if (allowDuplicableLoads) {
+#ifdef __PPU__
+    // See sliceAmplifiesExpensiveWork: refuse a retag that multiplies the
+    // per-thread work of the expensive scalar ops on this chain.
+    if (sliceAmplifiesExpensiveWork(slice, layout))
+      return failure();
+#endif // __PPU__
     for (Value v : slice) {
       Operation *op = v.getDefiningOp();
       if (!op || !isa<mlir::triton::DotOpInterface>(op))
@@ -4729,7 +4785,17 @@ static bool isExpensiveMathOp(Operation *op) {
   // These operations are either multiple instructions or have throughput
   // lower than 16 according to the arithmetic instructions table in:
   // https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#arithmetic-instructions
-  return isa<arith::DivFOp, math::ErfcOp, math::SinhOp, math::CoshOp,
+  //
+  // Integer div/rem belong here as well: there is no hardware integer division
+  // unit, so divsi/divui/remsi/remui lower to a compare-and-subtract loop (or a
+  // reciprocal plus correction), a few dozen instructions each. Leaving them
+  // out made them look cheap everywhere this predicate is used -- the remat
+  // cost model below, isLayoutTransparentProducer and isCoalescedLoadCopyValue
+  // -- which is how a retag that multiplied them per thread kept being
+  // accepted (pad_circular, PPU: divsi+remsi went from 1 to 8 copies per
+  // thread after the index chain was moved off the row dimension).
+  return isa<arith::DivFOp, arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
+             arith::RemUIOp, math::ErfcOp, math::SinhOp, math::CoshOp,
              math::TanhOp, math::AsinhOp, math::AcoshOp, math::AtanhOp,
              math::CtPopOp, math::CountLeadingZerosOp,
              math::CountTrailingZerosOp, math::ExpOp, math::Exp2Op,
