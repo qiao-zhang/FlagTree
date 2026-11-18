@@ -2464,6 +2464,52 @@ static bool widensPastRealContiguity(ModuleAxisInfoAnalysis *axisInfo,
 }
 #endif // __PPU__
 
+#ifdef __PPU__
+// True if materializing `value` in `target` multiplies how many copies of an
+// expensive op's result one thread must compute.
+//
+// A retag moves which dimension each thread owns, so a 1-D slice of an index
+// chain can go from one value per thread to shape[d] of them. Cheap elementwise
+// work does not care, but a division does: i32 div/rem expand into dozens of
+// instructions with no hardware unit behind them, and the kernel was already
+// executing them. Multiplied per thread, that is pure loss.
+//
+// The check is stated on that quantity and not on the layout's shape: a
+// shape-derived rule (e.g. "no dimension may lose thread coverage") would also
+// reject retags whose chain is pure address arithmetic, and those are the
+// profitable case -- they remove the convert and improve the access pattern at
+// no arithmetic cost.
+//
+// pad_circular, PPU: %b_13 = divsi and %h = remsi live on the row-index chain,
+// tensor<8xi32, slice<dim=1, parent=#blocked>>. Retagging the load from
+// threadsPerWarp [8,4] to [1,32] takes that slice from 1 to 8 elements per
+// thread, so the two divisions run 8x; shared dropped to 0 and the kernel still
+// regressed 16-44%.
+static bool amplifiesExpensiveWork(Value value, Attribute target,
+                                   const char *what) {
+  Operation *def = value.getDefiningOp();
+  if (!def || !isExpensiveMathOp(def))
+    return false;
+  auto type = dyn_cast<RankedTensorType>(value.getType());
+  if (!type || !type.getEncoding() || !target)
+    return false;
+  int64_t before = getTotalElemsPerThread(type);
+  int64_t after = getTotalElemsPerThread(type.cloneWithEncoding(target));
+  if (after <= before)
+    return false;
+  // `delta` is what the hardware pays: an i32 division is issued `after` times
+  // per thread, so the cost scales with that count, not with the ratio. Logging
+  // it lets a threshold be chosen from data instead of by guesswork.
+  if (rlcDbgLevel() >= 1)
+    llvm::errs() << "[rlc] " << what << ": " << def->getName()
+                 << " per-thread " << before << " -> " << after << " (delta "
+                 << (after - before) << ")"
+                 << " (" << rlcDbgEnc(type.getEncoding()) << " -> "
+                 << rlcDbgEnc(target) << ")\n";
+  return true;
+}
+#endif // __PPU__
+
 bool LayoutPropagation::solveSmallComponents() {
   if (!enableSmallComponentSolving)
     return false;
@@ -2615,6 +2661,17 @@ bool LayoutPropagation::solveSmallComponents() {
       return false;
     if (removedConverts < 2 && proposalDecoalescesContiguousStore(proposal))
       return false;
+#ifdef __PPU__
+    // A retag that multiplies the per-thread work of an expensive scalar op
+    // (i32 div/rem have no hardware unit) is a loss the convert-only cost model
+    // cannot see; see amplifiesExpensiveWork. The remat path applies the same
+    // guard in getRematerializableSlice -- this one covers
+    // collectProducerClosure -> commitIfProfitable, which never goes through
+    // it.
+    for (auto &it : proposal)
+      if (amplifiesExpensiveWork(it.first, it.second, "reject proposal"))
+        return false;
+#endif // __PPU__
     if (!proposalHasOnlyPairedForBlockArgs(proposal))
       return false;
     if (proposalHasRiskyScalarSideOutput(proposal))
@@ -4612,49 +4669,13 @@ LogicalResult LayoutRematerialization::getConvertBackwardSlice(
 
 #ifdef __FLAGTREE_RLC_ENHANCE__
 #ifdef __PPU__
-// A duplicable-load retag moves which dimension each thread owns, so a 1-D
-// slice of the index chain can go from one value per thread to shape[d] of
-// them. Cheap elementwise work does not matter, but a division does: i32 div/rem
-// expand into dozens of instructions with no hardware unit behind them, and the
-// kernel was already executing them. Multiplied per thread, that is pure loss.
-//
-// The check is stated on that quantity -- the per-thread element count of an
-// expensive op's result -- and not on the layout's shape. A shape-derived rule
-// (e.g. "no dimension may lose thread coverage") would also reject retags whose
-// chain is pure address arithmetic, and those are the profitable case: they
-// remove the convert and improve the access pattern at no arithmetic cost.
-//
-// pad_circular, PPU: %b_13 = divsi and %h = remsi live on the row-index chain,
-// tensor<8xi32, slice<dim=1, parent=#blocked>>. Retagging the load from
-// threadsPerWarp [8,4] to [1,32] takes that slice from 1 to 8 elements per
-// thread, so the two divisions run 8x; shared dropped to 0 and the kernel still
-// regressed 16-44%.
+// SetVector + layout-map form of amplifiesExpensiveWork (see there for the
+// rationale). Used by the duplicable-load remat path.
 static bool sliceAmplifiesExpensiveWork(
     const SetVector<Value> &slice, const DenseMap<Value, Attribute> &layout) {
-  for (Value value : slice) {
-    Operation *def = value.getDefiningOp();
-    if (!def || !isExpensiveMathOp(def))
-      continue;
-    auto type = dyn_cast<RankedTensorType>(value.getType());
-    Attribute target = layout.lookup(value);
-    if (!type || !type.getEncoding() || !target)
-      continue;
-    int64_t before = getTotalElemsPerThread(type);
-    int64_t after = getTotalElemsPerThread(type.cloneWithEncoding(target));
-    if (after > before) {
-      // `delta` is what the hardware actually pays: an i32 division is issued
-      // `after` times per thread, so the cost scales with that count, not with
-      // the ratio. Logging it lets the threshold be chosen from data instead of
-      // by guesswork.
-      if (rlcDbgLevel() >= 1)
-        llvm::errs() << "[rlc] reject remat: " << def->getName()
-                     << " per-thread " << before << " -> " << after
-                     << " (delta " << (after - before) << ")"
-                     << " (" << rlcDbgEnc(type.getEncoding()) << " -> "
-                     << rlcDbgEnc(target) << ")\n";
+  for (Value value : slice)
+    if (amplifiesExpensiveWork(value, layout.lookup(value), "reject remat"))
       return true;
-    }
-  }
   return false;
 }
 #endif // __PPU__
