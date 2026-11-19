@@ -4248,6 +4248,10 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   // A volatile load must not be duplicated either (see canBeRemat).
   if (loadOp.getIsVolatile())
     return false;
+#ifdef __PPU__
+  if (hasSingleUse(loadOp.getResult()))
+    return false;
+#endif // __PPU__
 #ifdef __TLE__
   // A load from a TLE cluster remote pointer lowers to a vectorized
   // shared::cluster load; duplicating or retagging it corrupts that access, so
