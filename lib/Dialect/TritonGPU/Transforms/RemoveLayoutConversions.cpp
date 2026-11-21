@@ -91,6 +91,21 @@ static int rlcDbgLevel() {
   return level;
 }
 
+// Probe-only switch. RLC_DEBUG=1 enables all decision logs (17 call sites, several
+// on per-value / per-slice hot paths), which is far more output than a single
+// diagnostic line per writeback needs — and in a pytest run with `-s` that output
+// goes straight to the terminal and dominates wall time. A probe that only wants
+// its own line should not have to pay for that:
+//   RLC_DEBUG_PROBE=1        print only the [rlc][probe] lines
+//   RLC_DEBUG=0 RLC_DEBUG_PROBE=1   same, with every other rlc log off
+static bool rlcProbeEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("RLC_DEBUG_PROBE");
+    return env && *env && std::atoi(env) != 0;
+  }();
+  return enabled;
+}
+
 // Compact encoding label: "b[spt]/t[tpw]/w[warps]/o[order]", "slice(dim,parent)".
 // Full `#ttg.blocked<{...}>` dumps make a log unreadable and are already in the
 // IR dumps; here the point is to compare two encodings at a glance.
@@ -5259,7 +5274,7 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
 #ifdef __PPU__
     // Diagnose why this writeback is skipped: is the value one cheap chain away
     // from a single convert, and what else hangs off that chain?
-    if (rlcDbgLevel() >= 1)
+    if (rlcDbgLevel() >= 1 || rlcProbeEnabled())
       probeWritebackValueChain(valueOperand.get());
 #endif // __PPU__
     return false;
