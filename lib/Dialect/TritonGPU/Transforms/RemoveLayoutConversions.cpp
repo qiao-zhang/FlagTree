@@ -106,6 +106,22 @@ static bool rlcProbeEnabled() {
   return enabled;
 }
 
+// Step 1 of the producer-chain extension for Phase 3 writeback remat. Off by
+// default: with it unset, rematerializeWritebackLayout behaves exactly as before
+// (only a value that is *directly* a convert_layout is considered).
+//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT=1
+// When on, a writeback whose value reaches a single convert_layout through a
+// chain of layout-transparent ops also qualifies, as long as the chain carries
+// no load (that is step 2: duplicating a load needs the cost check from
+// isDuplicableLoadInEncoding).
+static bool writebackChainRematEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT");
+    return env && *env && std::atoi(env) != 0;
+  }();
+  return enabled;
+}
+
 // Compact encoding label: "b[spt]/t[tpw]/w[warps]/o[order]", "slice(dim,parent)".
 // Full `#ttg.blocked<{...}>` dumps make a log unreadable and are already in the
 // IR dumps; here the point is to compare two encodings at a glance.
@@ -5142,6 +5158,37 @@ static bool isGlobalWritebackOp(Operation *op) {
 }
 
 #ifdef __PPU__
+// Walk up from a writeback value along layout-transparent producers to the single
+// convert_layout that feeds it. Returns null unless the shape is unambiguous:
+// exactly one convert, no load / reduce / anchor / block argument, and at most a
+// handful of hops. This is the "step 1" enabler — a chain that carries a load is
+// rejected here (duplicating a load is step 2 and needs its own cost check).
+static ConvertLayoutOp findWritebackChainConvert(Value value) {
+  ConvertLayoutOp found;
+  SmallVector<Value, 16> worklist{value};
+  DenseSet<Value> seen;
+  while (!worklist.empty() && seen.size() < 24) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    Operation *def = v.getDefiningOp();
+    if (!def) // block argument: cannot be rematerialized
+      return ConvertLayoutOp();
+    if (auto cvt = dyn_cast<ConvertLayoutOp>(def)) {
+      if (found && found != cvt)
+        return ConvertLayoutOp(); // two converts: one target cannot eat both
+      found = cvt;
+      continue; // stop at the convert, it is the one we want to remove
+    }
+    if (!isLayoutTransparentProducer(def)) // load / reduce / anchor / expensive math
+      return ConvertLayoutOp();
+    for (Value operand : def->getOperands())
+      if (isa<RankedTensorType>(operand.getType()))
+        worklist.push_back(operand);
+  }
+  return found;
+}
+
 // [可行性探针 · 只读，不改 IR、不改控制流] 回答一个问题：writeback 的 value 能否
 // 沿一条「单用 + 布局透明」的链连到**唯一**一个 convert_layout？
 //
@@ -5212,31 +5259,37 @@ static void probeWritebackValueChain(Value value) {
     for (Value r : op->getResults())
       loadBytes += getByteCount(r);
 
-  llvm::errs() << "[rlc][probe] writeback-value elems="
-               << valueType.getNumElements() << " chain=" << chain.size()
-               << " converts=" << converts.size() << " blockers="
-               << blockers.size() << " ops=[";
+  // Assemble the whole line first and emit it in one write: the compiler shares
+  // fd 2 with the driver (pytest, IR dumpers), and a dozen small `<<` calls can
+  // interleave into a half-mangled line when the log is interrupted or written
+  // from a second thread.
+  std::string line;
+  llvm::raw_string_ostream os(line);
+  os << "[rlc][probe] writeback-value elems=" << valueType.getNumElements()
+     << " chain=" << chain.size() << " converts=" << converts.size()
+     << " blockers=" << blockers.size() << " ops=[";
   for (size_t i = 0; i < chain.size(); ++i)
-    llvm::errs() << (i ? " " : "") << chain[i]->getName().getStringRef();
-  llvm::errs() << "]";
+    os << (i ? " " : "") << chain[i]->getName().getStringRef();
+  os << "]";
   for (Operation *op : blockers)
-    llvm::errs() << " blocked-by="
-                 << (op ? op->getName().getStringRef().str()
-                        : std::string("<block-arg>"));
+    os << " blocked-by="
+       << (op ? op->getName().getStringRef().str()
+              : std::string("<block-arg>"));
   if (loadBytes)
-    llvm::errs() << " load-bytes=" << loadBytes;
+    os << " load-bytes=" << loadBytes;
   if (converts.size() == 1) {
     auto cvt = converts.front();
     auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
     auto dstTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
     if (srcTy)
-      llvm::errs() << " cvt-src=" << rlcDbgEnc(srcTy.getEncoding());
+      os << " cvt-src=" << rlcDbgEnc(srcTy.getEncoding());
     if (dstTy)
-      llvm::errs() << " cvt-dst=" << rlcDbgEnc(dstTy.getEncoding());
+      os << " cvt-dst=" << rlcDbgEnc(dstTy.getEncoding());
     if (srcTy && dstTy)
-      llvm::errs() << " needs-shared=" << cvtNeedsSharedMemory(srcTy, dstTy);
+      os << " needs-shared=" << cvtNeedsSharedMemory(srcTy, dstTy);
   }
-  llvm::errs() << "\n";
+  os.flush();
+  llvm::errs() << line << "\n";
 }
 #endif // __PPU__
 
@@ -5270,14 +5323,47 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   OpOperand &ptrOperand = writebackOp->getOpOperand(0);
   OpOperand &valueOperand = writebackOp->getOpOperand(1);
   auto valueConvert = valueOperand.get().getDefiningOp<ConvertLayoutOp>();
+  // Step 1 of the producer-chain extension (off by default, see
+  // writebackChainRematEnabled). The chain slice is validated HERE, before any
+  // IR is touched: the commit below retags ptr/mask first, so a failure at that
+  // point would leave a half-rewritten writeback behind.
+  bool chainRemat = false;
+  SetVector<Value> chainSlice;
+  DenseMap<Value, Attribute> chainLayout;
   if (!valueConvert) {
 #ifdef __PPU__
-    // Diagnose why this writeback is skipped: is the value one cheap chain away
-    // from a single convert, and what else hangs off that chain?
-    if (rlcDbgLevel() >= 1 || rlcProbeEnabled())
-      probeWritebackValueChain(valueOperand.get());
+    if (writebackChainRematEnabled()) {
+      if (auto chainConvert = findWritebackChainConvert(valueOperand.get())) {
+        auto chainSrcTy =
+            dyn_cast<RankedTensorType>(chainConvert.getSrc().getType());
+        Attribute chainTarget =
+            chainSrcTy ? chainSrcTy.getEncoding() : Attribute();
+        if (chainTarget &&
+            succeeded(getRematerializableSlice(valueOperand, chainTarget,
+                                               chainSlice, chainLayout, nullptr,
+                                               /*allowDuplicableLoads=*/false))) {
+          valueConvert = chainConvert;
+          chainRemat = true;
+          if (rlcDbgLevel() >= 1)
+            llvm::errs() << "[rlc] chain-remat accept: value reaches one convert"
+                         << " through " << chainSlice.size()
+                         << " rematerializable value(s), tgt="
+                         << rlcDbgEnc(chainTarget) << "\n";
+        } else if (rlcDbgLevel() >= 1) {
+          llvm::errs() << "[rlc] chain-remat reject: chain not rematerializable\n";
+        }
+      }
+    }
 #endif // __PPU__
-    return false;
+    if (!valueConvert) {
+#ifdef __PPU__
+      // Diagnose why this writeback is skipped: is the value one cheap chain away
+      // from a single convert, and what else hangs off that chain?
+      if (rlcDbgLevel() >= 1 || rlcProbeEnabled())
+        probeWritebackValueChain(valueOperand.get());
+#endif // __PPU__
+      return false;
+    }
   }
   // The conversion must feed this writeback exclusively; otherwise it stays
   // live for its other users and we gain nothing.
@@ -5403,7 +5489,18 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
 
   // The value can now be written directly in its own layout. An atomic's
   // (unused) result must follow the value encoding.
-  valueOperand.set(valueConvert.getSrc());
+  if (!chainRemat) {
+    valueOperand.set(valueConvert.getSrc());
+  } else {
+    // Chain case: the value is not the convert's result, so moving the use to
+    // convert.getSrc() is not enough — the ops in between must be rebuilt in the
+    // target encoding. That is exactly what rewriteSlice does for the address /
+    // mask operands, and the convert in the middle becomes a no-op (its source is
+    // already in targetEncoding), so it is deleted by the cleanup below.
+    // chainSlice / chainLayout were validated before any IR was touched, so this
+    // cannot fail halfway.
+    rematerializeOperand(valueOperand, chainSlice, chainLayout);
+  }
   if (auto atomicOp = dyn_cast<AtomicRMWOp>(writebackOp))
     atomicOp.getResult().setType(targetType);
   if (valueConvert.getResult().use_empty())
