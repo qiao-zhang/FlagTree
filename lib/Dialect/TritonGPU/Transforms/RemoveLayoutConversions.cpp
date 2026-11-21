@@ -113,10 +113,22 @@ static bool rlcProbeEnabled() {
 // When on, a writeback whose value reaches a single convert_layout through a
 // chain of layout-transparent ops also qualifies, as long as the chain carries
 // no load (that is step 2: duplicating a load needs the cost check from
-// isDuplicableLoadInEncoding).
+// isChainLeafLoadAcceptable).
 static bool writebackChainRematEnabled() {
   static const bool enabled = [] {
     const char *env = std::getenv("FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT");
+    return env && *env && std::atoi(env) != 0;
+  }();
+  return enabled;
+}
+
+// Step 2 (requires step 1): also accept a chain whose leaf is a small,
+// single-use load. Off by default and independent, so step 1 stays observably
+// inert on its own.
+//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT_LOAD=1
+static bool writebackChainLoadRematEnabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT_LOAD");
     return env && *env && std::atoi(env) != 0;
   }();
   return enabled;
@@ -486,6 +498,12 @@ public:
   // any writeback was rewritten.
   bool rematerializeStoreLayout();
   bool rematerializeWritebackLayout(Operation *writebackOp);
+#ifdef __PPU__
+  // Step 2 of the writeback chain extension: a load that sits on the value chain
+  // may be crossed when it is small, single-use and keeps its access pattern —
+  // the chain is retagged, so the original load dies and the copy replaces it.
+  bool isChainLeafLoadAcceptable(Operation *op, Attribute targetEncoding) const;
+#endif // __PPU__
 #endif // __FLAGTREE_RLC_ENHANCE__
   // TODO: Merge the three hoistConvert*(); functions as they are duplicate code
   void hoistConvertDotOperand();
@@ -4432,8 +4450,16 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   if (loadOp.getIsVolatile())
     return false;
 #ifdef __PPU__
-  if (hasSingleUse(loadOp.getResult()))
+  // Only a single-use load may be crossed. Crossing rebuilds the consumer chain
+  // in the new encoding and leaves the original load unused, so with one consumer
+  // nothing is re-read; with several, the original stays alive for the rest and
+  // the "duplicate" really does add a global read.
+  if (!hasSingleUse(loadOp.getResult())) {
+    if (rlcDbgLevel() >= 2)
+      llvm::errs() << "[rlc-remat-load] multi-use load rejected: bytes="
+                   << getByteCount(loadOp.getResult()) << "\n";
     return false;
+  }
 #endif // __PPU__
 #ifdef __TLE__
   // A load from a TLE cluster remote pointer lowers to a vectorized
@@ -5145,6 +5171,13 @@ void LayoutRematerialization::backwardRematerialization(
 // layout (see rematerializeWritebackLayout).
 constexpr int64_t kTinyWritebackElems = 32;
 
+// A load sitting on a writeback value chain (step 2 of the chain extension) is
+// crossed only when the duplicate it costs is trivially small. The shapes here
+// are per-row vectors (addmv: 64x1 = 128–256 bytes), i.e. one vector per thread;
+// retagging the chain removes a cross-warp convert, worth far more than one
+// L1-resident re-read.
+constexpr int64_t kMaxChainLoadBytes = 4096;
+
 // A global writeback shares the (ptr, value, mask?) operand layout between
 // tt.store and tt.atomic_rmw, and requires all its tensor operands to use one
 // encoding. An atomic qualifies only when its result is unused, so changing
@@ -5163,7 +5196,8 @@ static bool isGlobalWritebackOp(Operation *op) {
 // exactly one convert, no load / reduce / anchor / block argument, and at most a
 // handful of hops. This is the "step 1" enabler — a chain that carries a load is
 // rejected here (duplicating a load is step 2 and needs its own cost check).
-static ConvertLayoutOp findWritebackChainConvert(Value value) {
+static ConvertLayoutOp findWritebackChainConvert(Value value,
+                                                 bool allowLeafLoads) {
   ConvertLayoutOp found;
   SmallVector<Value, 16> worklist{value};
   DenseSet<Value> seen;
@@ -5180,8 +5214,13 @@ static ConvertLayoutOp findWritebackChainConvert(Value value) {
       found = cvt;
       continue; // stop at the convert, it is the one we want to remove
     }
-    if (!isLayoutTransparentProducer(def)) // load / reduce / anchor / expensive math
-      return ConvertLayoutOp();
+    if (!isLayoutTransparentProducer(def)) {
+      // A load is a leaf: the chain ends there. Step 2 lets it stay, with size /
+      // single-use / access-pattern re-checked by isChainLeafLoadAcceptable.
+      if (allowLeafLoads && isa<LoadOp, LocalLoadOp>(def))
+        continue;
+      return ConvertLayoutOp(); // load / reduce / anchor / expensive math
+    }
     for (Value operand : def->getOperands())
       if (isa<RankedTensorType>(operand.getType()))
         worklist.push_back(operand);
@@ -5291,6 +5330,41 @@ static void probeWritebackValueChain(Value value) {
   os.flush();
   llvm::errs() << line << "\n";
 }
+
+// Step 2 cost check for a load that sits on a writeback value chain.
+//
+// Deliberately NOT isDuplicableLoadInEncoding: that guard exists for backward
+// remat's *duplicate* path and rejects single-use loads on PPU (c2f0b571f), which
+// is the opposite of what applies here. A writeback chain is retagged — every
+// consumer of the original load is rebuilt in the target encoding, so the load
+// dies and the copy replaces it one-for-one. Re-reading a small per-row vector
+// from L1 is cheaper than the cross-warp convert it removes, provided the copy
+// keeps the access pattern.
+bool LayoutRematerialization::isChainLeafLoadAcceptable(
+    Operation *op, Attribute targetEncoding) const {
+  auto loadOp = dyn_cast<LoadOp>(op);
+  if (!loadOp || loadOp.getIsVolatile())
+    return false;
+  // Single use is exactly the case that pays off here (see above).
+  if (!hasSingleUse(loadOp.getResult()))
+    return false;
+  auto resultType = dyn_cast<RankedTensorType>(loadOp.getType());
+  if (!resultType || !resultType.getEncoding())
+    return false;
+  if (getByteCount(loadOp.getResult()) > kMaxChainLoadBytes)
+    return false;
+  // A retag that de-coalesces the pointer chain would turn one vector read into
+  // a strided one, which can cost more than the convert saved.
+  if (axisInfoAnalysis &&
+      !isOrderIndifferentAccess(axisInfoAnalysis, loadOp.getPtr()))
+    return false;
+  if (rlcDbgLevel() >= 1)
+    llvm::errs() << "[rlc] chain-remat leaf load accepted: cur="
+                 << rlcDbgEnc(resultType.getEncoding())
+                 << " tgt=" << rlcDbgEnc(targetEncoding)
+                 << " bytes=" << getByteCount(loadOp.getResult()) << "\n";
+  return true;
+}
 #endif // __PPU__
 
 // True if the atomic lowers to vector (.v2/.v4/.v8) instructions, i.e. an fadd
@@ -5333,24 +5407,48 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   if (!valueConvert) {
 #ifdef __PPU__
     if (writebackChainRematEnabled()) {
-      if (auto chainConvert = findWritebackChainConvert(valueOperand.get())) {
+      const bool allowLeafLoads = writebackChainLoadRematEnabled();
+      if (auto chainConvert =
+              findWritebackChainConvert(valueOperand.get(), allowLeafLoads)) {
         auto chainSrcTy =
             dyn_cast<RankedTensorType>(chainConvert.getSrc().getType());
         Attribute chainTarget =
             chainSrcTy ? chainSrcTy.getEncoding() : Attribute();
-        if (chainTarget &&
-            succeeded(getRematerializableSlice(valueOperand, chainTarget,
-                                               chainSlice, chainLayout, nullptr,
-                                               /*allowDuplicableLoads=*/false))) {
+        // Build the slice here instead of calling getRematerializableSlice: that
+        // helper routes loads through isDuplicableLoadInEncoding, whose PPU rule
+        // rejects single-use loads (c2f0b571f). A retagged writeback chain is the
+        // opposite case — see isChainLeafLoadAcceptable.
+        bool ok = chainTarget &&
+                  succeeded(getConvertBackwardSlice(valueOperand, chainTarget,
+                                                    chainSlice, chainLayout,
+                                                    nullptr)) &&
+                  !chainSlice.empty();
+        for (Value v : chainSlice) {
+          if (!ok)
+            break;
+          Operation *def = v.getDefiningOp();
+          if (!def) { // block argument: nothing to rebuild
+            ok = false;
+            break;
+          }
+          if (canBeRemat(def))
+            continue;
+          if (allowLeafLoads && isChainLeafLoadAcceptable(def, chainTarget))
+            continue;
+          ok = false;
+        }
+        if (ok) {
           valueConvert = chainConvert;
           chainRemat = true;
           if (rlcDbgLevel() >= 1)
             llvm::errs() << "[rlc] chain-remat accept: value reaches one convert"
                          << " through " << chainSlice.size()
-                         << " rematerializable value(s), tgt="
-                         << rlcDbgEnc(chainTarget) << "\n";
+                         << " value(s), leaf-loads=" << (allowLeafLoads ? 1 : 0)
+                         << ", tgt=" << rlcDbgEnc(chainTarget) << "\n";
         } else if (rlcDbgLevel() >= 1) {
-          llvm::errs() << "[rlc] chain-remat reject: chain not rematerializable\n";
+          llvm::errs() << "[rlc] chain-remat reject: chain not rematerializable"
+                       << " (slice=" << chainSlice.size()
+                       << ", leaf-loads=" << (allowLeafLoads ? 1 : 0) << ")\n";
         }
       }
     }
