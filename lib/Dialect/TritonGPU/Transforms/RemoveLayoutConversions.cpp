@@ -4456,8 +4456,12 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   // the "duplicate" really does add a global read.
   if (!hasSingleUse(loadOp.getResult())) {
     if (rlcDbgLevel() >= 2)
+      // Explicit defaults: this sits above getByteCount's definition, so only the
+      // bare declaration (no default arguments) is visible here.
       llvm::errs() << "[rlc-remat-load] multi-use load rejected: bytes="
-                   << getByteCount(loadOp.getResult()) << "\n";
+                   << getByteCount(loadOp.getResult(), /*minElementCount=*/0,
+                                   /*minBitWidth=*/0)
+                   << "\n";
     return false;
   }
 #endif // __PPU__
