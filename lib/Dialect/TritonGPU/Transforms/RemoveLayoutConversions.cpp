@@ -5126,6 +5126,105 @@ static bool isGlobalWritebackOp(Operation *op) {
   return false;
 }
 
+#ifdef __PPU__
+// [可行性探针 · 只读，不改 IR、不改控制流] 回答一个问题：writeback 的 value 能否
+// 沿一条「单用 + 布局透明」的链连到**唯一**一个 convert_layout？
+//
+// Phase 3 目前要求 value 直接来自 convert（见下方 rematerializeWritebackLayout
+// 的首道检查），所以 block reduction 的 epilogue 一直够不到它，addmv 就是典型：
+//
+//   %r   = tt.reduce %acc         : tensor<64x512xf32,#blocked1> -> tensor<64xf32,slice{…#blocked1}>
+//   %cvt = ttg.convert_layout %r  : slice{…#blocked1} -> slice{…#blocked}   ← 跨 warp，贵
+//   %e   = tt.expand_dims %cvt    : -> tensor<64x1xf32,#blocked>
+//   %m   = arith.mulf %e, %alpha
+//   %i   = arith.mulf %inp, %beta   ← 这条分支上挂着一个 tt.load
+//   %s   = arith.addf %m, %i
+//   %t   = arith.truncf %s
+//   tt.store %ptr, %t, %mask
+//
+// 要让 Phase 3 吃掉那条 %cvt，入口就得放宽到 producer 链；而能不能放宽取决于链
+// 的形状：convert 是否唯一、链上还挂着什么（load / reduce / anchor / block arg）、
+// load 有多大（决定「复制小 load」的代价）。本函数只把这些事实打出来。
+static void probeWritebackValueChain(Value value) {
+  auto valueType = dyn_cast<RankedTensorType>(value.getType());
+  if (!valueType)
+    return;
+
+  SmallVector<Operation *, 8> chain;
+  SmallVector<Operation *, 4> blockers;
+  SmallVector<Operation *, 4> loads;
+  SmallVector<ConvertLayoutOp, 4> converts;
+  SmallVector<Value, 16> worklist{value};
+  DenseSet<Value> seen;
+
+  auto enqueue = [&](Value v) {
+    if (isa<RankedTensorType>(v.getType()))
+      worklist.push_back(v);
+  };
+
+  while (!worklist.empty() && chain.size() < 16) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    Operation *def = v.getDefiningOp();
+    if (!def) { // block argument: nothing to rematerialize
+      blockers.push_back(nullptr);
+      continue;
+    }
+    if (auto cvt = dyn_cast<ConvertLayoutOp>(def)) {
+      // Stop here: the walk must not cross the convert we want to eliminate.
+      converts.push_back(cvt);
+      continue;
+    }
+    if (isa<LoadOp, LocalLoadOp>(def)) {
+      loads.push_back(def);
+      blockers.push_back(def);
+      continue;
+    }
+    if (isa<ReduceOp>(def) || def->getNumRegions() != 0 ||
+        isLayoutAnchor(def) || isExpensiveMathOp(def) ||
+        !isLayoutTransparentProducer(def)) {
+      blockers.push_back(def);
+      continue;
+    }
+    chain.push_back(def);
+    for (Value operand : def->getOperands())
+      enqueue(operand);
+  }
+
+  int64_t loadBytes = 0;
+  for (Operation *op : loads)
+    for (Value r : op->getResults())
+      loadBytes += getByteCount(r);
+
+  llvm::errs() << "[rlc][probe] writeback-value elems="
+               << valueType.getNumElements() << " chain=" << chain.size()
+               << " converts=" << converts.size() << " blockers="
+               << blockers.size() << " ops=[";
+  for (size_t i = 0; i < chain.size(); ++i)
+    llvm::errs() << (i ? " " : "") << chain[i]->getName().getStringRef();
+  llvm::errs() << "]";
+  for (Operation *op : blockers)
+    llvm::errs() << " blocked-by="
+                 << (op ? op->getName().getStringRef().str()
+                        : std::string("<block-arg>"));
+  if (loadBytes)
+    llvm::errs() << " load-bytes=" << loadBytes;
+  if (converts.size() == 1) {
+    auto cvt = converts.front();
+    auto srcTy = dyn_cast<RankedTensorType>(cvt.getSrc().getType());
+    auto dstTy = dyn_cast<RankedTensorType>(cvt.getResult().getType());
+    if (srcTy)
+      llvm::errs() << " cvt-src=" << rlcDbgEnc(srcTy.getEncoding());
+    if (dstTy)
+      llvm::errs() << " cvt-dst=" << rlcDbgEnc(dstTy.getEncoding());
+    if (srcTy && dstTy)
+      llvm::errs() << " needs-shared=" << cvtNeedsSharedMemory(srcTy, dstTy);
+  }
+  llvm::errs() << "\n";
+}
+#endif // __PPU__
+
 // True if the atomic lowers to vector (.v2/.v4/.v8) instructions, i.e. an fadd
 // on f16/bf16/f32 on sm90+ (see AtomicRMWOpConversion::supportsVectorized).
 // Such an atomic loses width like a store when its per-thread contiguity
@@ -5156,8 +5255,15 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
   OpOperand &ptrOperand = writebackOp->getOpOperand(0);
   OpOperand &valueOperand = writebackOp->getOpOperand(1);
   auto valueConvert = valueOperand.get().getDefiningOp<ConvertLayoutOp>();
-  if (!valueConvert)
+  if (!valueConvert) {
+#ifdef __PPU__
+    // Diagnose why this writeback is skipped: is the value one cheap chain away
+    // from a single convert, and what else hangs off that chain?
+    if (rlcDbgLevel() >= 1)
+      probeWritebackValueChain(valueOperand.get());
+#endif // __PPU__
     return false;
+  }
   // The conversion must feed this writeback exclusively; otherwise it stays
   // live for its other users and we gain nothing.
   if (!hasSingleUse(valueConvert.getResult()))
