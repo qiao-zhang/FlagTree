@@ -5333,13 +5333,13 @@ static void probeWritebackValueChain(Value value) {
 
 // Step 2 cost check for a load that sits on a writeback value chain.
 //
-// Deliberately NOT isDuplicableLoadInEncoding: that guard exists for backward
-// remat's *duplicate* path and rejects single-use loads on PPU (c2f0b571f), which
-// is the opposite of what applies here. A writeback chain is retagged — every
-// consumer of the original load is rebuilt in the target encoding, so the load
-// dies and the copy replaces it one-for-one. Re-reading a small per-row vector
-// from L1 is cheaper than the cross-warp convert it removes, provided the copy
-// keeps the access pattern.
+// Deliberately NOT isDuplicableLoadInEncoding: that guard is scoped to backward
+// remat's broadcast-onto-MMA case and rejects blocked-slice targets outright
+// (they are cheap FMA-accumulator converts there). Here the target IS a blocked
+// slice and its convert is a cross-warp exchange, so the question is different —
+// is re-reading this load cheaper than that exchange? That needs: single use (the
+// rebuilt chain replaces the only consumer, so the original dies), a small
+// footprint, and an unchanged access pattern.
 bool LayoutRematerialization::isChainLeafLoadAcceptable(
     Operation *op, Attribute targetEncoding) const {
   auto loadOp = dyn_cast<LoadOp>(op);
@@ -5412,13 +5412,30 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
               findWritebackChainConvert(valueOperand.get(), allowLeafLoads)) {
         auto chainSrcTy =
             dyn_cast<RankedTensorType>(chainConvert.getSrc().getType());
+        auto chainResultTy =
+            dyn_cast<RankedTensorType>(chainConvert.getResult().getType());
+        auto storeValueTy =
+            dyn_cast<RankedTensorType>(valueOperand.get().getType());
         Attribute chainTarget =
             chainSrcTy ? chainSrcTy.getEncoding() : Attribute();
+        // The retag below rewrites ptr/mask to chainTarget, so chainTarget must be
+        // a legal encoding for their rank. A chain that changes rank between the
+        // convert and the store (a reduce followed by expand_dims) would need the
+        // target encoding propagated forward through that op; not done here, so
+        // such chains are rejected instead of building an invalid type.
+        const bool rankAgrees =
+            chainSrcTy && chainResultTy && storeValueTy &&
+            chainSrcTy.getRank() == storeValueTy.getRank();
+        if (!rankAgrees && rlcDbgLevel() >= 1) {
+          llvm::errs() << "[rlc] chain-remat reject: convert rank != store rank\n";
+        }
         // Build the slice here instead of calling getRematerializableSlice: that
-        // helper routes loads through isDuplicableLoadInEncoding, whose PPU rule
-        // rejects single-use loads (c2f0b571f). A retagged writeback chain is the
-        // opposite case — see isChainLeafLoadAcceptable.
-        bool ok = chainTarget &&
+        // helper routes loads through isDuplicableLoadInEncoding, which rejects
+        // blocked-slice targets outright (they are cheap FMA-accumulator converts
+        // in its MMA-broadcast setting). The targets here ARE blocked slices, and
+        // their convert is a cross-warp exchange, so that rule does not apply —
+        // see isChainLeafLoadAcceptable for what is checked instead.
+        bool ok = rankAgrees && chainTarget &&
                   succeeded(getConvertBackwardSlice(valueOperand, chainTarget,
                                                     chainSlice, chainLayout,
                                                     nullptr)) &&
