@@ -3624,6 +3624,61 @@ void LayoutPropagation::resolveConflicts() {
         }
         if (fewestWarps == ~0u)
           continue;
+        // [DIAGNOSTIC · 可回退] 用一次 A/B 判定 addmv 1024x65536 的 -13%
+        // 是否与 mv 同机制（收尾 convert 从"寄存器内挑一个"变成"跨 warp
+        // 交换"）。做法：当没有任何候选能把归约轴降到 1 个 warp 时，不把
+        // 选择交回下游（v1 证明那会被 legacy front() 与 Phase 1a 组件消解
+        // 覆盖），而是直接收敛到"非归约轴 warp 之和最小"的唯一候选。
+        // 收敛成 1 个候选后，:3678 的逐值定价与 :3659 的组件消解都会跳过，
+        // 因此布局必定生效，实验是可控的。
+        if (fewestWarps > 1) {
+          unsigned fewestOffAxis = ~0u;
+          for (Attribute enc : info.encodings) {
+            auto blocked = dyn_cast<BlockedEncodingAttr>(enc);
+            if (!blocked)
+              continue;
+            ArrayRef<unsigned> warps = blocked.getWarpsPerCTA();
+            if (axis >= warps.size())
+              continue;
+            unsigned off = 0;
+            for (unsigned d = 0; d < warps.size(); ++d)
+              if (d != axis)
+                off += warps[d];
+            fewestOffAxis = std::min(fewestOffAxis, off);
+          }
+          if (fewestOffAxis == ~0u)
+            continue;
+          SmallVector<Attribute, 8> offKeep;
+          for (Attribute enc : info.encodings) {
+            auto blocked = dyn_cast<BlockedEncodingAttr>(enc);
+            if (!blocked) {
+              offKeep.push_back(enc);
+              continue;
+            }
+            ArrayRef<unsigned> warps = blocked.getWarpsPerCTA();
+            if (axis >= warps.size()) {
+              offKeep.push_back(enc);
+              continue;
+            }
+            unsigned off = 0;
+            for (unsigned d = 0; d < warps.size(); ++d)
+              if (d != axis)
+                off += warps[d];
+            if (off <= fewestOffAxis)
+              offKeep.push_back(enc);
+          }
+          if (offKeep.size() == info.encodings.size())
+            continue;
+          info.encodings.clear();
+          for (Attribute enc : offKeep)
+            info.encodings.insert(enc);
+          if (rlcDbgLevel() >= 1)
+            llvm::errs() << "[rlc][exp] rc keep " << offKeep.size()
+                         << " off-axis-min candidate(s) (off=" << fewestOffAxis
+                         << ", fewestWarps[" << axis << "]=" << fewestWarps
+                         << ") from " << it.first << "\n";
+          continue;
+        }
         SmallVector<Attribute, 8> keep;
         for (Attribute enc : info.encodings) {
           auto blocked = dyn_cast<BlockedEncodingAttr>(enc);
