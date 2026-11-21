@@ -106,30 +106,30 @@ static bool rlcProbeEnabled() {
   return enabled;
 }
 
-// Step 1 of the producer-chain extension for Phase 3 writeback remat. Off by
-// default: with it unset, rematerializeWritebackLayout behaves exactly as before
-// (only a value that is *directly* a convert_layout is considered).
-//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT=1
-// When on, a writeback whose value reaches a single convert_layout through a
-// chain of layout-transparent ops also qualifies, as long as the chain carries
-// no load (that is step 2: duplicating a load needs the cost check from
-// isChainLeafLoadAcceptable).
+// Producer-chain extension for Phase 3 writeback remat. Enabled by default: a
+// writeback whose value reaches a single convert_layout through a chain of
+// layout-transparent ops is retagged as a whole, so the convert disappears
+// instead of being exchanged across warps.
+//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT=0     disable (escape hatch)
+// Trace what the chain walk decided with RLC_DEBUG=1 ([rlc] chain-remat ...).
 static bool writebackChainRematEnabled() {
   static const bool enabled = [] {
     const char *env = std::getenv("FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT");
-    return env && *env && std::atoi(env) != 0;
+    return !env || !*env || std::atoi(env) != 0; // default on
   }();
   return enabled;
 }
 
-// Step 2 (requires step 1): also accept a chain whose leaf is a small,
-// single-use load. Off by default and independent, so step 1 stays observably
-// inert on its own.
-//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT_LOAD=1
+// Also accept a chain whose leaf is a small, single-use load. Enabled by default
+// together with the chain itself: block-reduction epilogues (addmv) all carry one
+// (a per-row bias/alpha vector), so without it the chain extension never fires on
+// the case it was written for. Guarded by isChainLeafLoadAcceptable (single use,
+// <= kMaxChainLoadBytes, access pattern unchanged).
+//   FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT_LOAD=0   keep chains load-free only
 static bool writebackChainLoadRematEnabled() {
   static const bool enabled = [] {
     const char *env = std::getenv("FLAGTREE_RLC_WRITEBACK_CHAIN_REMAT_LOAD");
-    return env && *env && std::atoi(env) != 0;
+    return !env || !*env || std::atoi(env) != 0; // default on
   }();
   return enabled;
 }
@@ -4450,20 +4450,13 @@ static bool isDuplicableLoadInEncoding(Operation *op, Attribute encoding,
   if (loadOp.getIsVolatile())
     return false;
 #ifdef __PPU__
-  // Only a single-use load may be crossed. Crossing rebuilds the consumer chain
-  // in the new encoding and leaves the original load unused, so with one consumer
-  // nothing is re-read; with several, the original stays alive for the rest and
-  // the "duplicate" really does add a global read.
-  if (!hasSingleUse(loadOp.getResult())) {
-    if (rlcDbgLevel() >= 2)
-      // Explicit defaults: this sits above getByteCount's definition, so only the
-      // bare declaration (no default arguments) is visible here.
-      llvm::errs() << "[rlc-remat-load] multi-use load rejected: bytes="
-                   << getByteCount(loadOp.getResult(), /*minElementCount=*/0,
-                                   /*minBitWidth=*/0)
-                   << "\n";
+  // A single-use load must NOT be crossed. rewriteSlice rebuilds the consumer
+  // chain but only queues the convert and the for/if ops for deletion, so the
+  // crossed load stays behind as a dead tt.load — which canonicalization keeps
+  // (loads read) and which becomes a second global read. Flipping this condition
+  // regressed conv_tbc by -12.6% (one row even flipped from +3.4% to -12.6%).
+  if (hasSingleUse(loadOp.getResult()))
     return false;
-  }
 #endif // __PPU__
 #ifdef __TLE__
   // A load from a TLE cluster remote pointer lowers to a vectorized
@@ -5173,7 +5166,11 @@ void LayoutRematerialization::backwardRematerialization(
 // way. The convert in front of it can still be a shared-memory round trip with
 // barriers, so Phase 3 may retag such a writeback onto the stored value's
 // layout (see rematerializeWritebackLayout).
-constexpr int64_t kTinyWritebackElems = 32;
+// A writeback of at most two warps' worth of elements buys no bandwidth from its
+// layout: the whole store is one or two memory transactions either way, and at
+// most two warps' lanes take part. Raised from 32 (one warp) to 64 so the block
+// reduction epilogues reach the chain path — addmv writes 64 values per program.
+constexpr int64_t kTinyWritebackElems = 64;
 
 // A load sitting on a writeback value chain (step 2 of the chain extension) is
 // crossed only when the duplicate it costs is trivially small. The shapes here
@@ -5618,7 +5615,18 @@ bool LayoutRematerialization::rematerializeWritebackLayout(
     // already in targetEncoding), so it is deleted by the cleanup below.
     // chainSlice / chainLayout were validated before any IR was touched, so this
     // cannot fail halfway.
+    SmallVector<Operation *, 8> chainOrigins;
+    for (Value v : chainSlice)
+      if (Operation *def = v.getDefiningOp())
+        chainOrigins.push_back(def);
     rematerializeOperand(valueOperand, chainSlice, chainLayout);
+    // rewriteSlice rebuilds these ops but only queues the convert and the for/if
+    // ops for deletion, so without this the originals survive as dead ops. A dead
+    // tt.load is the expensive one: canonicalization keeps it (it reads), so it
+    // stays a second global read. cleanup() re-checks uses before erasing, so any
+    // op still feeding a value outside this slice is kept.
+    for (Operation *op : chainOrigins)
+      opToDelete.insert(op);
   }
   if (auto atomicOp = dyn_cast<AtomicRMWOp>(writebackOp))
     atomicOp.getResult().setType(targetType);
