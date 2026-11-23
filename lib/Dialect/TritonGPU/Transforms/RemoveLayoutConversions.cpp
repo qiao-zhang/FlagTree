@@ -3483,6 +3483,46 @@ void LayoutPropagation::resolveConflicts() {
     if (Attribute original = getTensorEncoding(it.first))
       info.encodings.insert(original);
   }
+
+  // Candidate sets for component-level resolution, captured before the
+  // per-value rules below collapse them.
+  llvm::MapVector<Value, SmallVector<Attribute>> componentCandidates;
+  if (enableCostBasedResolution) {
+    for (auto &it : layouts) {
+      const LayoutInfo &info = it.second;
+      if (info.encodings.size() <= 1 ||
+          smallComponentPreferredEncoding.contains(it.first) ||
+          !isa<RankedTensorType>(it.first.getType()))
+        continue;
+#ifdef __TLE__
+      if (!info.hardEncodings.empty())
+        continue;
+#endif // __TLE__
+      bool blockedOnly = llvm::all_of(info.encodings, [](Attribute enc) {
+        return isBlockedOrBlockedSliceEncoding(enc);
+      });
+      if (blockedOnly)
+        componentCandidates[it.first] = SmallVector<Attribute>(
+            info.encodings.begin(), info.encodings.end());
+    }
+  }
+#endif // __FLAGTREE_RLC_ENHANCE__
+  for (auto &it : layouts) {
+    LayoutInfo &info = it.second;
+    if (info.encodings.size() <= 1)
+      continue;
+#ifdef __TLE__
+    // An explicit (tle.gpu.set_layout) encoding wins over every rule below.
+    if (!info.hardEncodings.empty()) {
+      Attribute encoding = *info.hardEncodings.begin();
+      info.encodings.clear();
+      info.encodings.insert(encoding);
+      info.hardEncodings.clear();
+      info.hardEncodings.insert(encoding);
+      continue;
+    }
+#endif // __TLE__
+#ifdef __FLAGTREE_RLC_ENHANCE__
 #ifdef __PPU__
   // A value feeding tt.reduce/tt.scan must not carry warps on the reduced axis:
   // the reduction would then need a shared-memory round trip plus a barrier on
@@ -3553,45 +3593,6 @@ void LayoutPropagation::resolveConflicts() {
     }
   }
 #endif // __PPU__
-  // Candidate sets for component-level resolution, captured before the
-  // per-value rules below collapse them.
-  llvm::MapVector<Value, SmallVector<Attribute>> componentCandidates;
-  if (enableCostBasedResolution) {
-    for (auto &it : layouts) {
-      const LayoutInfo &info = it.second;
-      if (info.encodings.size() <= 1 ||
-          smallComponentPreferredEncoding.contains(it.first) ||
-          !isa<RankedTensorType>(it.first.getType()))
-        continue;
-#ifdef __TLE__
-      if (!info.hardEncodings.empty())
-        continue;
-#endif // __TLE__
-      bool blockedOnly = llvm::all_of(info.encodings, [](Attribute enc) {
-        return isBlockedOrBlockedSliceEncoding(enc);
-      });
-      if (blockedOnly)
-        componentCandidates[it.first] = SmallVector<Attribute>(
-            info.encodings.begin(), info.encodings.end());
-    }
-  }
-#endif // __FLAGTREE_RLC_ENHANCE__
-  for (auto &it : layouts) {
-    LayoutInfo &info = it.second;
-    if (info.encodings.size() <= 1)
-      continue;
-#ifdef __TLE__
-    // An explicit (tle.gpu.set_layout) encoding wins over every rule below.
-    if (!info.hardEncodings.empty()) {
-      Attribute encoding = *info.hardEncodings.begin();
-      info.encodings.clear();
-      info.encodings.insert(encoding);
-      info.hardEncodings.clear();
-      info.hardEncodings.insert(encoding);
-      continue;
-    }
-#endif // __TLE__
-#ifdef __FLAGTREE_RLC_ENHANCE__
     Value value = it.first;
     Operation *defOp = value.getDefiningOp();
     if (auto preferred = smallComponentPreferredEncoding.lookup(value)) {
